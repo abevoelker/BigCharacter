@@ -4,8 +4,8 @@
     Purpose     : Mimics LONGCHAR, but removes performance penalties.
     Author(s)   : Abe Voelker
     Created     : Mon Oct 04 19:45:25 CDT 2010
-    Notes       : * This version can run out of stack space for very
-                    large amounts of data ("increase -s" error messages).
+    Notes       : * This version can run out of local buffer space for very
+                    large amounts of data ("increase -l" error messages).
   ----------------------------------------------------------------------*/
 
 USING Progress.Lang.*.
@@ -14,61 +14,85 @@ ROUTINE-LEVEL ON ERROR UNDO, THROW.
 
 CLASS BigCharacter USE-WIDGET-POOL:
 
-    &SCOPED-DEFINE TT_CHARACTER_MAX       31977
     &SCOPED-DEFINE CHARACTER_DATATYPE_MAX 31991
 
-    DEFINE PRIVATE VARIABLE iNumBlocks    AS INTEGER NO-UNDO.
-    DEFINE PRIVATE VARIABLE iTotBlockSize AS INT64   NO-UNDO. /* The total size of all blocks, in bytes */
+    DEFINE PRIVATE VARIABLE iMaxBlocks AS INTEGER NO-UNDO. /* Max number of CharBlocks */
+    DEFINE PRIVATE VARIABLE iNumBlocks AS INTEGER NO-UNDO.
 
-	DEFINE PRIVATE TEMP-TABLE ttChar NO-UNDO
-      FIELD iPK         AS INTEGER
-      FIELD cData       AS CHARACTER
-      FIELD iDataLength AS INTEGER
+    DEFINE PRIVATE TEMP-TABLE ttBlock NO-UNDO
+      FIELD iPK      AS INTEGER
+      FIELD objBlock AS Object
       INDEX IXPK IS PRIMARY UNIQUE iPK.
 		
-	CONSTRUCTOR PUBLIC BigCharacter ():
-		SUPER ().
-		CREATE ttChar.
+    CONSTRUCTOR PUBLIC BigCharacter ():
+		SUPER().
+		iMaxBlocks = 500. /* Default */
+		CREATE ttBlock.
+		ASSIGN iNumBlocks       = 1
+		       ttBlock.objBlock = NEW CharBlock(THIS-OBJECT)
+		       ttBlock.iPK      = iNumBlocks.
+	END CONSTRUCTOR.
+		
+	CONSTRUCTOR PUBLIC BigCharacter (INPUT ipiMaxBlocks AS INTEGER):
+		SUPER().
+		iMaxBlocks = ipiMaxBlocks.
+		CREATE ttBlock.
+		ASSIGN iNumBlocks       = 1
+		       ttBlock.objBlock = NEW CharBlock(THIS-OBJECT)
+		       ttBlock.iPK      = iNumBlocks.
 	END CONSTRUCTOR.
 	
     METHOD PUBLIC VOID empty():
-	    EMPTY TEMP-TABLE ttChar NO-ERROR.
-	    CREATE ttChar.
-	    ASSIGN iNumBlocks    = 0
-               iTotBlockSize = 0.
+        FOR EACH ttBlock:
+            IF VALID-OBJECT(ttBlock.objBlock) THEN
+                DELETE OBJECT ttBlock.objBlock NO-ERROR.
+        END.
+	    EMPTY TEMP-TABLE ttBlock NO-ERROR.
+	    CREATE ttBlock.
+	    ASSIGN iNumBlocks       = 1
+		       ttBlock.objBlock = NEW CharBlock(THIS-OBJECT)
+		       ttBlock.iPK      = iNumBlocks.
 	END METHOD.
     
 	METHOD PUBLIC VOID append(INPUT ipc AS CHARACTER):
-        DEF VAR iAvailSpace AS INTEGER NO-UNDO.
-        FIND LAST ttChar.
-        iAvailSpace = {&TT_CHARACTER_MAX} - ttChar.iDataLength.
+	    FIND LAST ttBlock.
 	    
-        IF LENGTH(ipc) GT iAvailSpace THEN DO:
-            /* If there is some space available in the last block, then fill it */
-            IF iAvailSpace GT 0 THEN DO:
-                ASSIGN ttChar.cData       = ttChar.cData + SUBSTRING(ipc, 1, iAvailSpace)
-                       ttChar.iDataLength = LENGTH(ttChar.cData)
-                       iTotBlockSize      = iTotBlockSize + LENGTH(SUBSTRING(ipc, 1, iAvailSpace))
-                       ipc                = SUBSTRING(ipc, iAvailSpace + 1).
-            END.
-            /* The last block has been filled and we need more space, so allocate a new block */
-            newBlock().
-            append(ipc). /* Recursion, baby! */
-        END.
-        ELSE DO:
-            ASSIGN ttChar.cData       = ttChar.cData + ipc
-                   ttChar.iDataLength = ttChar.iDataLength + LENGTH(ipc)
-                   iTotBlockSize      = iTotBlockSize + LENGTH(ipc).
-        END.
+	    IF CAST(ttBlock.objBlock, CharBlock):getNumBlocks() GE iMaxBlocks THEN DO:
+	        CREATE ttBlock.
+	        ASSIGN iNumBlocks       = iNumBlocks + 1
+	               ttBlock.objBlock = NEW CharBlock(THIS-OBJECT)
+	               ttBlock.iPK      = iNumBlocks.
+	    END.
+	    
+	    CAST(ttBlock.objBlock, CharBlock):append(ipc).
     END METHOD.
     
     METHOD PUBLIC VOID append(INPUT iplc AS LONGCHAR):
-        /* Break the LONGCHAR into CHARACTER data, and send to that method */
+        FIND LAST ttBlock.
+	    
+	    IF CAST(ttBlock.objBlock, CharBlock):getNumBlocks() GE iMaxBlocks THEN DO:
+	        CREATE ttBlock.
+	        ASSIGN iNumBlocks       = iNumBlocks + 1
+	               ttBlock.objBlock = NEW CharBlock(THIS-OBJECT)
+	               ttBlock.iPK      = iNumBlocks.
+	    END.
+	    
+	    CAST(ttBlock.objBlock, CharBlock):append(iplc).
+    END METHOD.
+    
+    METHOD PUBLIC VOID append(INPUT ipobjbc AS BigCharacter):
         DEF VAR i AS INT NO-UNDO.
-        DO WHILE i LT LENGTH(iplc):
-            THIS-OBJECT:append(STRING(SUBSTRING(iplc, i + 1, {&CHARACTER_DATATYPE_MAX}))).
-            i = i + {&CHARACTER_DATATYPE_MAX}.
-        END.
+        
+        FIND LAST ttBlock.
+	    DO i=1 TO ipobjbc:getNumBlocks():
+    	    IF CAST(ttBlock.objBlock, CharBlock):getNumBlocks() GE iMaxBlocks THEN DO:
+    	        CREATE ttBlock.
+    	        ASSIGN iNumBlocks       = iNumBlocks + 1
+    	               ttBlock.objBlock = NEW CharBlock(THIS-OBJECT)
+    	               ttBlock.iPK      = iNumBlocks.
+    	    END.
+    	    CAST(ttBlock.objBlock, CharBlock):append(ipobjbc:getCharBlock(i)).
+	    END.
     END METHOD.
     
     METHOD PUBLIC VOID setValue(INPUT ipcString AS CHARACTER):
@@ -81,6 +105,11 @@ CLASS BigCharacter USE-WIDGET-POOL:
         THIS-OBJECT:append(iplcString).
     END.
     
+    METHOD PUBLIC VOID setValue(INPUT ipobjbc AS BigCharacter):
+        THIS-OBJECT:empty().
+        THIS-OBJECT:append(ipobjbc).
+    END.
+    
 	METHOD PUBLIC INTEGER indexOf(INPUT ipcString   AS CHARACTER):
 	    RETURN INDEX(THIS-OBJECT:toLongchar(), ipcString).
 	END METHOD.
@@ -90,31 +119,79 @@ CLASS BigCharacter USE-WIDGET-POOL:
 	    RETURN INDEX(THIS-OBJECT:toLongchar(), ipcString, ipiStarting).
 	END METHOD.
     
-	METHOD PUBLIC LONGCHAR substr(INPUT ipiPosition AS INTEGER):
-	    RETURN SUBSTRING(THIS-OBJECT:toLongchar(), ipiPosition).
+	METHOD PUBLIC BigCharacter substr(INPUT ipiPosition AS INTEGER):
+	    DEFINE VARIABLE obj AS BigCharacter NO-UNDO.
+	    obj:append(SUBSTRING(THIS-OBJECT:toLongchar(), ipiPosition)).
+	    RETURN obj.
 	END.
 	
-	METHOD PUBLIC LONGCHAR substr(INPUT ipiPosition AS INTEGER,
+	METHOD PUBLIC BigCharacter substr(INPUT ipiPosition AS INTEGER,
 	                              INPUT ipiLength   AS INTEGER):
-	    RETURN SUBSTRING(THIS-OBJECT:toLongchar(), ipiPosition, ipiLength).
+	    DEFINE VARIABLE obj AS BigCharacter NO-UNDO.
+	    obj:append(SUBSTRING(THIS-OBJECT:toLongchar(), ipiPosition, ipiLength)).
+	    RETURN obj.
 	END.
     
     METHOD PUBLIC LONGCHAR toLongchar():
         DEFINE VARIABLE oplc AS LONGCHAR NO-UNDO.
-        FOR EACH ttChar:
-          oplc = oplc + ttChar.c.
+        FOR EACH ttBlock:
+          oplc = oplc + CAST(ttBlock.objBlock, CharBlock):toLongchar().
         END.
         RETURN oplc.
     END METHOD.
     
-    METHOD PRIVATE VOID newBlock():
-        iNumBlocks = iNumBlocks + 1.
-        CREATE ttChar.
-        ttChar.iPK = iNumBlocks.
+    /* Note: If too much data to fit in a CHAR, method will return ? */
+    METHOD PUBLIC CHARACTER toChar():
+        DEFINE VARIABLE opc   AS CHARACTER        NO-UNDO.
+        DEFINE VARIABLE i     AS INTEGER   INIT 1 NO-UNDO.
+        DEFINE VARIABLE iSize AS INTEGER          NO-UNDO.
+        
+        FOR EACH ttBlock:
+            iSize = iSize + CAST(ttBlock.objBlock, CharBlock):size().
+            IF iSize GT {&CHARACTER_DATATYPE_MAX} THEN
+                RETURN ?.
+            ELSE
+                opc = opc + CAST(ttBlock.objBlock, CharBlock):getBlock(i).
+            i = i + 1.
+        END.
+        RETURN opc.
+    END METHOD.
+    
+    METHOD PUBLIC LOGICAL toFile(INPUT ipcFile AS CHARACTER,
+                                 INPUT iplAppend AS LOGICAL):
+        IF NOT iplAppend THEN
+            OS-DELETE VALUE(ipcFile).
+        FOR EACH ttBlock:
+            IF NOT CAST(ttBlock.objBlock, CharBlock):toFile(ipcFile, TRUE) THEN
+                RETURN FALSE.
+        END.
+        RETURN TRUE.
+    END METHOD.
+    
+    METHOD PUBLIC LOGICAL toFile(INPUT ipcFile AS CHARACTER):
+        RETURN THIS-OBJECT:toFile(ipcFile, FALSE). /* Default is to clobber the old file */
     END METHOD.
     
     METHOD PUBLIC INT64 size():
+        DEFINE VARIABLE iTotBlockSize AS INT64 NO-UNDO.
+        FOR EACH ttBlock:
+            iTotBlockSize = iTotBlockSize + CAST(ttBlock.objBlock, CharBlock):size().
+        END.
         RETURN iTotBlockSize.
     END.
+    
+    /* Progress epic-fails when the below method is set to PRIVATE or PROTECTED */
+    METHOD PUBLIC INTEGER getNumBlocks():
+        RETURN iNumBlocks.
+    END METHOD.
+    
+    /* Progress epic-fails when the below method is set to PRIVATE or PROTECTED */
+    METHOD PUBLIC CharBlock getCharBlock(INPUT ipiCharBlockNum AS INTEGER):
+        FIND FIRST ttBlock WHERE ttBlock.iPK EQ ipiCharBlockNum NO-ERROR.
+        IF AVAILABLE ttBlock THEN
+            RETURN CAST(ttBlock.objBlock, CharBlock).
+        ELSE
+            RETURN ?.
+    END METHOD.
 
 END CLASS.
